@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { generateId, today, toDateString, getElapsedMs } from './utils';
 import { supabase, toDbTask, fromDbTask, toDbRewards, fromDbRewards } from './supabase';
+import AuthPage from './components/AuthPage';
 import Header from './components/Header';
 import QuickAdd from './components/QuickAdd';
 import Sidebar from './components/Sidebar';
@@ -36,6 +37,7 @@ function sortTasks(tasks, sortBy) {
 }
 
 export default function App() {
+  const [user, setUser] = useState(undefined); // undefined = loading, null = logged out
   const [tasks, setTasks] = useState([]);
   const [rewards, setRewards] = useState(DEFAULT_REWARDS);
   const [selectedDate, setSelectedDate] = useState(today());
@@ -46,68 +48,36 @@ export default function App() {
   const [showConfetti, setShowConfetti] = useState(false);
   const [pointsBadge, setPointsBadge] = useState(null);
   const [tick, setTick] = useState(0);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
   const [dbError, setDbError] = useState(null);
-
   const tickRef = useRef(null);
 
-  // Load data from Supabase on mount, migrate localStorage if present
+  // Auth state — check session on mount and listen for changes
   useEffect(() => {
-    loadData();
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
 
-  async function loadData() {
-    setIsLoading(true);
-    setDbError(null);
-    try {
-      const [tasksRes, rewardsRes] = await Promise.all([
-        supabase.from('tasks').select('*').order('created_at', { ascending: false }),
-        supabase.from('rewards').select('*').eq('id', 1).single(),
-      ]);
-
-      if (tasksRes.error) throw tasksRes.error;
-
-      const remoteTasks = (tasksRes.data || []).map(fromDbTask);
-      const remoteRewards = rewardsRes.data ? fromDbRewards(rewardsRes.data) : DEFAULT_REWARDS;
-
-      // Migrate from localStorage if remote is empty and local has data
-      const localTasks = parseLocal('tm-tasks', []);
-      const localRewards = parseLocal('tm-rewards', null);
-
-      if (remoteTasks.length === 0 && localTasks.length > 0) {
-        await supabase.from('tasks').upsert(localTasks.map(toDbTask));
-        if (localRewards) {
-          await supabase.from('rewards').upsert(toDbRewards(localRewards));
-        }
-        setTasks(localTasks);
-        setRewards(localRewards || DEFAULT_REWARDS);
-        clearLocal();
-      } else {
-        setTasks(remoteTasks);
-        setRewards(remoteRewards);
-        clearLocal();
-      }
-
-      const savedDate = localStorage.getItem('tm-date');
-      if (savedDate) setSelectedDate(savedDate);
-    } catch (err) {
-      console.error('Supabase error:', err);
-      setDbError('Could not connect to database. Check your Supabase credentials and table setup.');
-    } finally {
-      setIsLoading(false);
+  // Load data whenever user changes
+  useEffect(() => {
+    if (user) {
+      loadData(user.id);
+      const saved = localStorage.getItem('tm-date');
+      if (saved) setSelectedDate(saved);
+    } else if (user === null) {
+      setTasks([]);
+      setRewards(DEFAULT_REWARDS);
     }
-  }
+  }, [user]);
 
-  function parseLocal(key, fallback) {
-    try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
-  }
-
-  function clearLocal() {
-    localStorage.removeItem('tm-tasks');
-    localStorage.removeItem('tm-rewards');
-  }
-
-  // Persist selected date in localStorage (UI preference only)
+  // Persist selected date
   useEffect(() => {
     localStorage.setItem('tm-date', selectedDate);
   }, [selectedDate]);
@@ -123,23 +93,44 @@ export default function App() {
     return () => clearInterval(tickRef.current);
   }, [hasActiveTimer]);
 
-  // Derived state
-  const dateTasks = tasks.filter(t => t.date === selectedDate);
-  const filteredTasks = (() => {
-    let result = dateTasks;
-    if (filters.statuses?.length) result = result.filter(t => filters.statuses.includes(t.status));
-    if (filters.priorities?.length) result = result.filter(t => filters.priorities.includes(t.priority));
-    return sortTasks(result, filters.sortBy);
-  })();
-  const completedTasks = filteredTasks.filter(t => t.status === 'completed');
-  const activeTasks = filteredTasks.filter(t => t.status !== 'completed');
-  const selectedTask = tasks.find(t => t.id === selectedTaskId) ?? null;
+  async function loadData(userId) {
+    setIsLoading(true);
+    setDbError(null);
+    try {
+      const [tasksRes, rewardsRes] = await Promise.all([
+        supabase.from('tasks').select('*').eq('user_id', userId).order('created_at', { ascending: false }),
+        supabase.from('rewards').select('*').eq('user_id', userId).single(),
+      ]);
 
-  // --- Actions ---
+      if (tasksRes.error) throw tasksRes.error;
+
+      setTasks((tasksRes.data || []).map(fromDbTask));
+      setRewards(rewardsRes.data ? fromDbRewards(rewardsRes.data) : DEFAULT_REWARDS);
+
+      // Migrate any existing tasks with no user_id to this user
+      await supabase.from('tasks').update({ user_id: userId }).is('user_id', null);
+      await supabase.from('rewards').update({ user_id: userId }).is('user_id', null);
+    } catch (err) {
+      console.error('Load error:', err);
+      setDbError('Failed to load data. Please try again.');
+    } finally {
+      setIsLoading(false);
+    }
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    setTasks([]);
+    setRewards(DEFAULT_REWARDS);
+    setSelectedTaskId(null);
+  }
+
+  // --- Task actions ---
 
   async function addTask(fields) {
     const task = {
       id: generateId(),
+      userId: user.id,
       title: fields.title,
       description: fields.description || '',
       project: fields.project || '',
@@ -156,8 +147,8 @@ export default function App() {
       date: selectedDate,
     };
     setTasks(prev => [task, ...prev]);
-    const { error } = await supabase.from('tasks').insert(toDbTask(task));
-    if (error) console.error('Failed to add task:', error);
+    const { error } = await supabase.from('tasks').insert(toDbTask(task, user.id));
+    if (error) console.error('Add task error:', error);
   }
 
   async function updateTask(id, updates) {
@@ -168,8 +159,8 @@ export default function App() {
       return updated;
     }));
     if (updated) {
-      const { error } = await supabase.from('tasks').upsert(toDbTask(updated));
-      if (error) console.error('Failed to update task:', error);
+      const { error } = await supabase.from('tasks').upsert(toDbTask(updated, user.id));
+      if (error) console.error('Update task error:', error);
     }
   }
 
@@ -178,44 +169,39 @@ export default function App() {
     setTasks(prev => prev.filter(t => t.id !== id));
     setDeleteConfirmId(null);
     const { error } = await supabase.from('tasks').delete().eq('id', id);
-    if (error) console.error('Failed to delete task:', error);
+    if (error) console.error('Delete task error:', error);
   }
 
   async function startTimer(id) {
     const now = new Date().toISOString();
-    const updatedTasks = [];
-
+    const updatedList = [];
     setTasks(prev => {
       const next = prev.map(t => {
         if (t.id === id) {
           const u = { ...t, status: 'in-progress', timerStartedAt: now, actualStart: t.actualStart || now };
-          updatedTasks.push(u);
+          updatedList.push(u);
           return u;
         }
         if (t.timerStartedAt) {
           const elapsed = Date.now() - new Date(t.timerStartedAt).getTime();
           const u = { ...t, accumulatedMs: (t.accumulatedMs || 0) + elapsed, timerStartedAt: null, status: 'paused' };
-          updatedTasks.push(u);
+          updatedList.push(u);
           return u;
         }
         return t;
       });
       return next;
     });
-
     setTimeout(async () => {
-      for (const u of updatedTasks) {
-        const { error } = await supabase.from('tasks').upsert(toDbTask(u));
-        if (error) console.error('Failed to sync timer start:', error);
+      for (const u of updatedList) {
+        await supabase.from('tasks').upsert(toDbTask(u, user.id));
       }
     }, 0);
-
     setRewards(prev => {
-      const newCount = prev.timerUseCount + 1;
-      const updated = { ...prev, timerUseCount: newCount };
-      updated.badges = checkBadges(updated);
-      syncRewards(updated);
-      return updated;
+      const next = { ...prev, timerUseCount: prev.timerUseCount + 1 };
+      next.badges = checkBadges(next);
+      syncRewards(next);
+      return next;
     });
   }
 
@@ -227,10 +213,7 @@ export default function App() {
       updated = { ...t, accumulatedMs: (t.accumulatedMs || 0) + elapsed, timerStartedAt: null, status: 'paused' };
       return updated;
     }));
-    if (updated) {
-      const { error } = await supabase.from('tasks').upsert(toDbTask(updated));
-      if (error) console.error('Failed to sync pause:', error);
-    }
+    if (updated) await supabase.from('tasks').upsert(toDbTask(updated, user.id));
   }
 
   async function stopTimer(id) {
@@ -242,10 +225,7 @@ export default function App() {
       updated = { ...t, status: 'completed', timerStartedAt: null, actualEnd: now, accumulatedMs: (t.accumulatedMs || 0) + extraMs };
       return updated;
     }));
-    if (updated) {
-      const { error } = await supabase.from('tasks').upsert(toDbTask(updated));
-      if (error) console.error('Failed to sync stop:', error);
-    }
+    if (updated) await supabase.from('tasks').upsert(toDbTask(updated, user.id));
     triggerComplete(id);
   }
 
@@ -254,16 +234,9 @@ export default function App() {
     if (!task) return;
     const now = new Date().toISOString();
     const extraMs = task.timerStartedAt ? Date.now() - new Date(task.timerStartedAt).getTime() : 0;
-    const updated = {
-      ...task,
-      status: 'completed',
-      timerStartedAt: null,
-      actualEnd: task.actualEnd || now,
-      accumulatedMs: (task.accumulatedMs || 0) + extraMs,
-    };
+    const updated = { ...task, status: 'completed', timerStartedAt: null, actualEnd: task.actualEnd || now, accumulatedMs: (task.accumulatedMs || 0) + extraMs };
     setTasks(prev => prev.map(t => t.id === id ? updated : t));
-    const { error } = await supabase.from('tasks').upsert(toDbTask(updated));
-    if (error) console.error('Failed to sync complete:', error);
+    await supabase.from('tasks').upsert(toDbTask(updated, user.id));
     triggerComplete(id);
   }
 
@@ -271,59 +244,66 @@ export default function App() {
     const task = tasks.find(t => t.id === id);
     const hadTimer = !!(task?.timerStartedAt || task?.accumulatedMs > 0);
     const points = POINTS_PER_TASK + (hadTimer ? POINTS_TIMER_BONUS : 0);
-
     setRewards(prev => {
       const newPoints = prev.points + points;
       const newCompleted = prev.completedCount + 1;
       const todayStr = today();
-      let newStreak = prev.streakDays;
-      if (prev.lastCompletedDate !== todayStr) {
-        const yesterday = toDateString(new Date(Date.now() - 86400000));
-        newStreak = prev.lastCompletedDate === yesterday ? prev.streakDays + 1 : 1;
-      }
+      const yesterday = toDateString(new Date(Date.now() - 86400000));
+      let newStreak = prev.lastCompletedDate === yesterday ? prev.streakDays + 1 : prev.streakDays;
+      if (prev.lastCompletedDate !== todayStr) newStreak = prev.lastCompletedDate === yesterday ? prev.streakDays + 1 : 1;
       const next = { ...prev, points: newPoints, completedCount: newCompleted, streakDays: newStreak, lastCompletedDate: todayStr };
       next.badges = checkBadges(next);
       syncRewards(next);
       return next;
     });
-
     setShowConfetti(true);
-    setPointsBadge({ amount: points, show: true });
+    setPointsBadge({ amount: points });
     setTimeout(() => setPointsBadge(null), 2200);
   }
 
   async function syncRewards(r) {
-    const { error } = await supabase.from('rewards').upsert(toDbRewards(r));
-    if (error) console.error('Failed to sync rewards:', error);
+    await supabase.from('rewards').upsert(toDbRewards(r, user.id));
   }
 
   function checkBadges(r) {
-    const current = new Set(r.badges || []);
+    const s = new Set(r.badges || []);
     [
-      ['first_task', r.completedCount >= 1],
-      ['five_tasks', r.completedCount >= 5],
-      ['ten_tasks', r.completedCount >= 10],
-      ['streak_3', r.streakDays >= 3],
-      ['streak_7', r.streakDays >= 7],
-      ['points_50', r.points >= 50],
-      ['points_100', r.points >= 100],
-      ['timer_5', r.timerUseCount >= 5],
+      ['first_task', r.completedCount >= 1], ['five_tasks', r.completedCount >= 5],
+      ['ten_tasks', r.completedCount >= 10], ['streak_3', r.streakDays >= 3],
+      ['streak_7', r.streakDays >= 7], ['points_50', r.points >= 50],
+      ['points_100', r.points >= 100], ['timer_5', r.timerUseCount >= 5],
       ['timer_20', r.timerUseCount >= 20],
-    ].forEach(([id, earned]) => { if (earned) current.add(id); });
-    return [...current];
+    ].forEach(([id, earned]) => { if (earned) s.add(id); });
+    return [...s];
   }
 
-  const VIEW_TITLES = { tasks: 'Tasks', timeline: 'Timeline', summary: 'Daily Summary', rewards: 'Rewards' };
+  // --- Render ---
 
+  // Still checking session
+  if (user === undefined) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', gap: 12, color: 'var(--gray-500)' }}>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--teal)" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}>
+          <circle cx="12" cy="12" r="10" strokeOpacity="0.25" /><path d="M12 2a10 10 0 0 1 10 10" />
+        </svg>
+        <span>Loading…</span>
+      </div>
+    );
+  }
+
+  // Not logged in
+  if (user === null) return <AuthPage />;
+
+  // Loading data
   if (isLoading) {
     return (
-      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100vh', gap: 12, color: 'var(--gray-500)' }}>
-        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--teal)" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}>
-          <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
-          <path d="M12 2a10 10 0 0 1 10 10" />
-        </svg>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', gap: 12, color: 'var(--gray-500)' }}>
         <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-        <span style={{ fontSize: 14 }}>Connecting to database…</span>
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="var(--teal)" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}>
+          <circle cx="12" cy="12" r="10" strokeOpacity="0.25" /><path d="M12 2a10 10 0 0 1 10 10" />
+        </svg>
+        <span>Loading your tasks…</span>
       </div>
     );
   }
@@ -332,16 +312,28 @@ export default function App() {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100vh', gap: 16, padding: 24, textAlign: 'center' }}>
         <div style={{ fontSize: 32 }}>⚠️</div>
-        <div style={{ fontWeight: 600, color: 'var(--gray-700)' }}>Database connection failed</div>
+        <div style={{ fontWeight: 600 }}>Database error</div>
         <div style={{ fontSize: 13, color: 'var(--gray-500)', maxWidth: 400 }}>{dbError}</div>
-        <button className="btn-primary" onClick={loadData}>Retry</button>
+        <button className="btn-primary" onClick={() => loadData(user.id)}>Retry</button>
       </div>
     );
   }
 
+  const dateTasks = tasks.filter(t => t.date === selectedDate);
+  const filteredTasks = (() => {
+    let r = dateTasks;
+    if (filters.statuses?.length) r = r.filter(t => filters.statuses.includes(t.status));
+    if (filters.priorities?.length) r = r.filter(t => filters.priorities.includes(t.priority));
+    return sortTasks(r, filters.sortBy);
+  })();
+  const activeTasks = filteredTasks.filter(t => t.status !== 'completed');
+  const completedTasks = filteredTasks.filter(t => t.status === 'completed');
+  const selectedTask = tasks.find(t => t.id === selectedTaskId) ?? null;
+  const VIEW_TITLES = { tasks: 'Tasks', timeline: 'Timeline', summary: 'Daily Summary', rewards: 'Rewards' };
+
   return (
     <div className="app">
-      <Header selectedDate={selectedDate} onDateChange={setSelectedDate} />
+      <Header selectedDate={selectedDate} onDateChange={setSelectedDate} user={user} onLogout={handleLogout} />
       <QuickAdd onAdd={addTask} />
 
       <div className="main-layout" style={{ flex: 1, overflow: 'hidden' }}>
@@ -423,7 +415,7 @@ export default function App() {
         </div>
       )}
 
-      {pointsBadge?.show && (
+      {pointsBadge && (
         <div className="points-badge" style={{ bottom: 80, right: 32 }}>+{pointsBadge.amount} pts</div>
       )}
 
