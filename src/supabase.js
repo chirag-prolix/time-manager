@@ -5,9 +5,10 @@ export const supabase = createClient(
   import.meta.env.VITE_SUPABASE_ANON_KEY
 );
 
-export function toDbTask(task) {
+export function toDbTask(task, userId) {
   return {
     id: task.id,
+    user_id: userId || task.userId,
     date: task.date,
     title: task.title,
     description: task.description || '',
@@ -28,6 +29,7 @@ export function toDbTask(task) {
 export function fromDbTask(row) {
   return {
     id: row.id,
+    userId: row.user_id,
     date: row.date,
     title: row.title,
     description: row.description || '',
@@ -45,9 +47,9 @@ export function fromDbTask(row) {
   };
 }
 
-export function toDbRewards(r) {
+export function toDbRewards(r, userId) {
   return {
-    id: 1,
+    user_id: userId || r.userId,
     points: r.points || 0,
     streak_days: r.streakDays || 0,
     completed_count: r.completedCount || 0,
@@ -59,6 +61,7 @@ export function toDbRewards(r) {
 
 export function fromDbRewards(row) {
   return {
+    userId: row.user_id,
     points: row.points || 0,
     streakDays: row.streak_days || 0,
     completedCount: row.completed_count || 0,
